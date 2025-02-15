@@ -6,6 +6,7 @@
 
 #include "globals.h"
 #include "table.h"
+#include <array> // Include the array header
 
 namespace fs = boost::filesystem;
 
@@ -29,6 +30,7 @@ public:
 	void minimize();
 	void permute(permutation p);
 	edge_vec brute_force_mhs();
+	void assign_extendable_task(const edge &xv, const edge &y, const edge &x, const edge &yv, edge::size_type r, edge_vec &minimal_hitting_sets);
 private:
 	enumerate_configuration m_configuration;
 	Table m_hitting_set_stats;
@@ -40,6 +42,7 @@ private:
 	int extendable(const edge &x, const edge &y);
 	void enumerate(const edge &x, const edge &y, edge::size_type r, edge_vec &minimal_hitting_sets);
 	void enumerate_legacy(const edge &x, const edge &y, edge::size_type r, edge_vec &minimal_hitting_sets);
+	void worker();
 	int maximum_iteration_count(std::vector<edge_vec> s);
 	int summed_sx_sizes(std::vector<edge_vec> s);
 	int total_number_of_vertices_in_s(std::vector<edge_vec> s);

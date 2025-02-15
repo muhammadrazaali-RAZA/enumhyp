@@ -4,6 +4,12 @@
 #include <sstream>
 #include <map>
 #include <utility>
+#include <mpi.h>
+#include <thread>
+#include <vector>
+#include <queue>    // For std::queue
+#include <tuple>    // For std::tuple
+#include <unordered_map>
 
 #define NOT_EXTENDABLE 0
 #define EXTENDABLE 1
@@ -245,22 +251,395 @@ edge_vec Hypergraph::enumerate_legacy() {
 }
 
 void Hypergraph::enumerate_legacy(const edge &x, const edge &y, edge::size_type r, edge_vec &minimal_hitting_sets) {
-	if (r == m_num_vertices) {
-		minimal_hitting_sets.push_back(x);
-		if (m_configuration.collect_hitting_set_statistics) {
-			auto now = Clock::now();
-			m_hitting_set_stats.add_record({ edge_to_string(x), ns_string(m_hitting_set_timestamp, now) });
-			m_hitting_set_timestamp = Clock::now();
-		}
-		return;
-	}
-	edge xv = x;
-	edge yv = y;
-	xv[r] = 1;
-	yv[r] = 1;
-	if (extendable(xv, y)) enumerate_legacy(xv, y, r + 1, minimal_hitting_sets);
-	if (extendable(x, yv)) enumerate_legacy(x, yv, r + 1, minimal_hitting_sets);
+    if (r == m_num_vertices) {
+        minimal_hitting_sets.push_back(x);
+        if (m_configuration.collect_hitting_set_statistics) {
+            auto now = Clock::now();
+            m_hitting_set_stats.add_record({ edge_to_string(x), ns_string(m_hitting_set_timestamp, now) });
+            m_hitting_set_timestamp = Clock::now();
+        }
+        return;
+    }
+
+    edge xv = x;
+    edge yv = y;
+    xv[r] = 1;
+    yv[r] = 1;
+
+    assign_extendable_task(xv, y, x, yv,r+1,minimal_hitting_sets);
+	return;
 }
+
+
+struct WorkData {
+    std::vector<int> x_vec;
+    std::vector<int> y_vec;
+    int hitting_sets_size;
+    std::vector<int> serialized_hitting_sets;
+    unsigned long r;
+};
+
+
+void Hypergraph::assign_extendable_task(
+    const edge &xv, const edge &y, const edge &x, const edge &yv, edge::size_type r, edge_vec &minimal_hitting_sets) {
+
+    MPI_Status status;
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    if (rank == 0) {
+        std::queue<int> available_workers;
+        int num_processes;
+        MPI_Comm_size(MPI_COMM_WORLD, &num_processes);
+
+        // Initialize worker pool
+        for (int i = 1; i < num_processes; ++i) available_workers.push(i);
+
+        // Convert edges to vectors
+        std::vector<int> xv_vec(xv.size()), y_vec(y.size()), x_vec(x.size()), yv_vec(yv.size());
+        for (size_t i = 0; i < xv.size(); ++i) xv_vec[i] = xv[i];
+        for (size_t i = 0; i < y.size(); ++i) y_vec[i] = y[i];
+        for (size_t i = 0; i < x.size(); ++i) x_vec[i] = x[i];
+        for (size_t i = 0; i < yv.size(); ++i) yv_vec[i] = yv[i];
+
+		// Serialize minimal_hitting_sets into a flat vector
+		std::vector<int> serialized_hitting_sets;
+		for (const auto &set : minimal_hitting_sets) {
+			for (size_t i = 0; i < set.size(); ++i) {
+				serialized_hitting_sets.push_back(set[i] ? 1 : 0);
+			}
+		}
+		// Prepare size metadata
+		int hitting_sets_size = serialized_hitting_sets.size();	
+
+        // Assign first task to available workers
+        int worker_rank1 = available_workers.front();
+        available_workers.pop();
+
+        int worker_rank2 = available_workers.front();
+        available_workers.pop();
+
+        // std::cout << "Master (rank 0) assigning task to worker " << worker_rank1 << " for xv and y.\n";
+        // std::cout << "Master (rank 0) assigning task to worker " << worker_rank2 << " for x and yv.\n";
+
+        // Create arrays to store MPI_Request objects for the non-blocking sends
+		MPI_Request requests[10];
+		int req_count = 0;
+
+		// Use MPI_Isend to send tasks and recursion levels for worker_rank1
+		MPI_Isend(xv_vec.data(), xv_vec.size(), MPI_INT, worker_rank1, 1, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(y_vec.data(), y_vec.size(), MPI_INT, worker_rank1, 2, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(&hitting_sets_size, 1, MPI_INT, worker_rank1, 3, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(serialized_hitting_sets.data(), hitting_sets_size, MPI_INT, worker_rank1, 4, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(&r, 1, MPI_UNSIGNED_LONG, worker_rank1, 5, MPI_COMM_WORLD, &requests[req_count++]);
+
+		// Use MPI_Isend to send tasks and recursion levels for worker_rank2
+		MPI_Isend(x_vec.data(), x_vec.size(), MPI_INT, worker_rank2, 1, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(yv_vec.data(), yv_vec.size(), MPI_INT, worker_rank2, 2, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(&hitting_sets_size, 1, MPI_INT, worker_rank2, 3, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(serialized_hitting_sets.data(), hitting_sets_size, MPI_INT, worker_rank2, 4, MPI_COMM_WORLD, &requests[req_count++]);
+		MPI_Isend(&r, 1, MPI_UNSIGNED_LONG, worker_rank2, 5, MPI_COMM_WORLD, &requests[req_count++]);
+
+		// Wait for all sends to complete before reusing or modifying the buffers
+		MPI_Waitall(req_count, requests, MPI_STATUSES_IGNORE);
+
+		// Dynamic array to hold tasks
+		std::vector<WorkData> tasks;
+
+		// Handle results dynamically
+		while (!(tasks.empty() && (available_workers.size() == num_processes - 1))) {
+			// std::cout << " Available Workers : " << available_workers.size() << "\n";
+			// std::cout << " Number of Tasks   : " << tasks.size()<< "\n";
+
+			if (!tasks.empty() && !available_workers.empty()) {
+				int worker_rank = available_workers.front();
+				available_workers.pop();
+
+				WorkData task = tasks.back();
+				tasks.pop_back();
+
+				// Prepare MPI_Request objects for non-blocking sends
+				MPI_Request send_requests[5];
+				int req_count = 0;
+
+				// Use MPI_Isend to send task data to the worker
+				MPI_Isend(task.x_vec.data(), task.x_vec.size(), MPI_INT, worker_rank, 1, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(task.y_vec.data(), task.y_vec.size(), MPI_INT, worker_rank, 2, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(&task.hitting_sets_size, 1, MPI_INT, worker_rank, 3, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(task.serialized_hitting_sets.data(), task.hitting_sets_size, MPI_INT, worker_rank, 4, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(&task.r, 1, MPI_UNSIGNED_LONG, worker_rank, 5, MPI_COMM_WORLD, &send_requests[req_count++]);
+
+				// Wait for all sends to complete
+				MPI_Waitall(req_count, send_requests, MPI_STATUSES_IGNORE);
+
+				// std::cout << "Master sent task to worker " << worker_rank << "\n";
+			}
+
+			// Prepare MPI_Request objects for non-blocking receives
+			std::vector<MPI_Request> recv_requests(5);
+			std::vector<int> recv_x_vec(xv.size()), recv_y_vec(yv.size());
+			std::vector<int> serialized_hitting_sets;
+			edge::size_type recv_r;
+			int hitting_sets_size;
+
+			// Probe to find the source and tag of the incoming message
+			MPI_Probe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
+			// Get the source of the message
+			int source = status.MPI_SOURCE;
+
+			// Use MPI_Irecv for non-blocking receives
+			MPI_Irecv(recv_x_vec.data(), recv_x_vec.size(), MPI_INT, source, 1, MPI_COMM_WORLD, &recv_requests[0]);
+			MPI_Irecv(recv_y_vec.data(), recv_y_vec.size(), MPI_INT, source, 2, MPI_COMM_WORLD, &recv_requests[1]);
+			MPI_Irecv(&hitting_sets_size, 1, MPI_INT, source, 3, MPI_COMM_WORLD, &recv_requests[2]);
+
+			// Wait for the hitting_sets_size to be received before allocating the buffer
+			MPI_Wait(&recv_requests[2], MPI_STATUS_IGNORE);
+			serialized_hitting_sets.resize(hitting_sets_size);
+
+			MPI_Irecv(serialized_hitting_sets.data(), hitting_sets_size, MPI_INT, source, 4, MPI_COMM_WORLD, &recv_requests[3]);
+			MPI_Irecv(&recv_r, 1, MPI_UNSIGNED_LONG, source, 5, MPI_COMM_WORLD, &recv_requests[4]);
+
+			// Wait for all the receives to complete
+			MPI_Waitall(5, recv_requests.data(), MPI_STATUSES_IGNORE);
+
+			// Check if the worker is signaling that it's free
+			if (recv_r == 0) {
+				// Worker is free, add it back to the pool of available workers
+				available_workers.push(source);
+				// std::cout << "Master: Worker " << source << " is free (r = 0).\n";
+			} else {
+				// Store received data into the task array for further processing
+				WorkData new_task = {recv_x_vec, recv_y_vec, hitting_sets_size, serialized_hitting_sets, recv_r};
+				tasks.push_back(new_task);
+				// std::cout << "Master: Received task result from worker " << source << " with r = " << recv_r << ".\n";
+			}
+        }
+
+		if (tasks.empty() && (available_workers.size() == num_processes - 1)){
+			// Send termination signals to all workers
+			std::vector<int> terminate_signal(2, -1); // Termination signal vector (-1 indicates termination)
+			std::vector<MPI_Request> termination_requests((num_processes - 1) * 5); // Adjust for 5 sends per worker
+			int req_count = 0;
+
+			// Loop through all worker processes (excluding the master)
+			for (int i = 1; i < num_processes; ++i) {
+				// Send termination signal in the same structure as task assignment
+				MPI_Isend(terminate_signal.data(), terminate_signal.size(), MPI_INT, i, 1, MPI_COMM_WORLD, &termination_requests[req_count++]);
+				MPI_Isend(terminate_signal.data(), terminate_signal.size(), MPI_INT, i, 2, MPI_COMM_WORLD, &termination_requests[req_count++]);
+				MPI_Isend(&terminate_signal[0], 1, MPI_INT, i, 3, MPI_COMM_WORLD, &termination_requests[req_count++]); // Simulating hitting_sets_size
+				MPI_Isend(terminate_signal.data(), terminate_signal.size(), MPI_INT, i, 4, MPI_COMM_WORLD, &termination_requests[req_count++]);
+				MPI_Isend(&terminate_signal[0], 1, MPI_UNSIGNED_LONG, i, 5, MPI_COMM_WORLD, &termination_requests[req_count++]); // Simulating r
+			}
+
+			// Wait for all termination signals to be sent
+			MPI_Waitall(req_count, termination_requests.data(), MPI_STATUSES_IGNORE);
+
+			// std::cout << " >>> Sent Termination signals to all workers.\n";
+		}			
+
+    } else {
+        worker();  // Non-master processes become workers
+    }
+	MPI_Finalize();
+	return;
+}
+
+void Hypergraph::worker() {
+    MPI_Status status;
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    // std::cout << "Worker " << rank << " started and waiting for tasks from master (rank 0).\n";
+
+    bool extend = false;
+    std::vector<int> a_vec(m_num_vertices);
+    std::vector<int> b_vec(m_num_vertices);
+    edge::size_type r;
+
+    int hitting_sets_size;
+    edge_vec minimal_hitting_sets;
+    std::vector<int> serialized_hitting_sets;
+    
+    edge a;
+    edge b;
+    bool terminate;
+
+    while (true) {
+
+        if (!extend) {
+            terminate = true;
+
+            MPI_Request recv_requests[5];
+
+            // Non-blocking receive for a_vec
+            MPI_Irecv(a_vec.data(), a_vec.size(), MPI_INT, 0, 1, MPI_COMM_WORLD, &recv_requests[0]);
+
+            // Non-blocking receive for b_vec
+            MPI_Irecv(b_vec.data(), b_vec.size(), MPI_INT, 0, 2, MPI_COMM_WORLD, &recv_requests[1]);
+
+            // Non-blocking receive for hitting_sets_size
+            MPI_Irecv(&hitting_sets_size, 1, MPI_INT, 0, 3, MPI_COMM_WORLD, &recv_requests[2]);
+
+            // Non-blocking receive for serialized_hitting_sets (placeholder size initially)
+            MPI_Irecv(serialized_hitting_sets.data(), serialized_hitting_sets.size(), MPI_INT, 0, 4, MPI_COMM_WORLD, &recv_requests[3]);
+
+            // Non-blocking receive for r
+            MPI_Irecv(&r, 1, MPI_UNSIGNED_LONG, 0, 5, MPI_COMM_WORLD, &recv_requests[4]);
+
+            // Wait for a_vec to check for termination signal
+            MPI_Wait(&recv_requests[0], &status);
+
+            // Check for termination signal in a_vec
+            if (!a_vec.empty() && a_vec[0] == -1) {
+                // std::cout << "#### Worker " << rank << " received Termination signal.\n";
+                break; // Exit the worker loop immediately
+            }
+
+            // Wait for hitting_sets_size
+            MPI_Wait(&recv_requests[2], &status);
+
+            // Resize serialized_hitting_sets based on hitting_sets_size
+            serialized_hitting_sets.resize(hitting_sets_size);
+
+            // Wait for all other receives to complete
+            MPI_Waitall(4, &recv_requests[1], MPI_STATUSES_IGNORE);
+
+            // Deserialize minimal_hitting_sets
+            minimal_hitting_sets.clear();
+            for (size_t i = 0; i < hitting_sets_size; i += m_num_vertices) {
+                edge set(m_num_vertices);
+                for (size_t j = 0; j < m_num_vertices; ++j) {
+                    set[j] = serialized_hitting_sets[i + j];
+                }
+                minimal_hitting_sets.push_back(set);
+            }
+
+
+			// Convert vectors to edges safely
+			a.resize(a_vec.size());
+			a.reset();
+			b.resize(b_vec.size());
+			b.reset();
+
+			// Convert vectors to edges
+			for (size_t i = 0; i < a_vec.size(); ++i) a[i] = a_vec[i];
+			for (size_t i = 0; i < b_vec.size(); ++i) b[i] = b_vec[i];
+        }
+
+
+		// // Debug: Print task received by worker
+        // std::cout << "Worker " << rank << " received task with vectors:\n";
+        // std::cout << "a_vec: ";
+        // for (auto v : a_vec) std::cout << v << " ";
+        // std::cout << "\nb_vec: ";
+        // for (auto v : b_vec) std::cout << v << " ";
+        // std::cout << std::endl;
+		// std::cout << "\nr: ";
+		// std::cout << r <<std::endl;
+
+        // Check extendability
+		if(terminate){
+        	extend = extendable(a, b);
+		}
+
+        if (extend) {
+            if (r == m_num_vertices) {
+                minimal_hitting_sets.push_back(a);  // Correct edge assignment
+				// std::cout << "\nWorker " << rank << " found set --  ";
+				// std::cout << "\nWorker " << rank << " terminating with minimal hitting set: ";
+				// for (size_t i = 0; i < a.size(); ++i) {
+				// 	std::cout << a[i] << " ";
+				// }
+				// std::cout << "\n";
+
+                if (m_configuration.collect_hitting_set_statistics) {
+                    auto now = Clock::now();
+                    m_hitting_set_stats.add_record({ edge_to_string(a), ns_string(m_hitting_set_timestamp, now) });
+                    m_hitting_set_timestamp = Clock::now();
+                }
+				terminate = false;
+				extend = false;
+
+				MPI_Request send_requests[5];
+				int req_count = 0;
+				r = 0; // Indicate worker is free
+
+				// Non-blocking send to master
+				MPI_Isend(a_vec.data(), a_vec.size(), MPI_INT, 0, 1, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(b_vec.data(), b_vec.size(), MPI_INT, 0, 2, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(&hitting_sets_size, 1, MPI_INT, 0, 3, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(serialized_hitting_sets.data(), hitting_sets_size, MPI_INT, 0, 4, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(&r, 1, MPI_UNSIGNED_LONG, 0, 5, MPI_COMM_WORLD, &send_requests[req_count++]);
+
+				// Wait for all sends to complete
+				MPI_Waitall(req_count, send_requests, MPI_STATUSES_IGNORE);
+            }else {
+				// Proper assignment with safer Boost functions
+				edge xv = a, yv = b;
+				xv.set(r); 
+				yv.set(r);
+				r++;
+
+				std::vector<int> x_vec(a.size()), yv_vec(yv.size());
+				for (size_t i = 0; i < a.size(); ++i) x_vec[i] = a[i];
+				for (size_t i = 0; i < yv.size(); ++i) yv_vec[i] = yv[i];
+
+				// std::cout << "xv: ";
+				// for (auto v : x_vec) std::cout << v << " ";
+				// std::cout << "\nyv: ";
+				// for (auto v : yv_vec) std::cout << v << " ";
+				// std::cout << std::endl;
+
+				// Prepare MPI_Request objects for non-blocking sends
+				MPI_Request send_requests[5];
+				int req_count = 0;
+
+				// Use MPI_Isend to send data back to the master
+				MPI_Isend(x_vec.data(), x_vec.size(), MPI_INT, 0, 1, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(yv_vec.data(), yv_vec.size(), MPI_INT, 0, 2, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(&hitting_sets_size, 1, MPI_INT, 0, 3, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(serialized_hitting_sets.data(), hitting_sets_size, MPI_INT, 0, 4, MPI_COMM_WORLD, &send_requests[req_count++]);
+				MPI_Isend(&r, 1, MPI_UNSIGNED_LONG, 0, 5, MPI_COMM_WORLD, &send_requests[req_count++]);
+
+				// Wait for all sends to complete
+				MPI_Waitall(req_count, send_requests, MPI_STATUSES_IGNORE);
+
+				// std::cout << "Worker " << rank << " sent task successfully.\n";
+
+				// Continue processing with a = xv
+				a = xv;
+
+				// Convert edge `a` back to a vector for debugging
+				std::vector<int> a_vec(a.size());
+				for (size_t i = 0; i < a.size(); ++i) a_vec[i] = a[i];
+
+				// Debug output for `a`
+				// std::cout << "\n a = xv: ";
+				// for (const auto& v : a_vec) std::cout << v << " ";
+				// std::cout << std::endl;
+			}
+        }else{
+			MPI_Request send_requests[5];
+			int req_count = 0;
+			r = 0; // Indicate worker is free
+
+			// Non-blocking send to master
+			MPI_Isend(a_vec.data(), a_vec.size(), MPI_INT, 0, 1, MPI_COMM_WORLD, &send_requests[req_count++]);
+			MPI_Isend(b_vec.data(), b_vec.size(), MPI_INT, 0, 2, MPI_COMM_WORLD, &send_requests[req_count++]);
+			MPI_Isend(&hitting_sets_size, 1, MPI_INT, 0, 3, MPI_COMM_WORLD, &send_requests[req_count++]);
+			MPI_Isend(serialized_hitting_sets.data(), hitting_sets_size, MPI_INT, 0, 4, MPI_COMM_WORLD, &send_requests[req_count++]);
+			MPI_Isend(&r, 1, MPI_UNSIGNED_LONG, 0, 5, MPI_COMM_WORLD, &send_requests[req_count++]);
+
+			// Wait for all sends to complete
+			MPI_Waitall(req_count, send_requests, MPI_STATUSES_IGNORE);
+
+			// std::cout << "Worker " << rank << " is free (r = 0) and reported back to master.\n";
+		}
+    }
+	return;
+}
+
+
 
 void Hypergraph::minimize() {
 	edge_set new_edges;
@@ -268,7 +647,7 @@ void Hypergraph::minimize() {
 		bool insert = true;
 		edge_vec to_delete;
 		for (edge new_edge : new_edges) {
-			if (new_edge.is_subset_of(old_edge)) { // subset edge already exists
+			if (new_edge.is_subset_of(old_edge)) {
 				insert = false;
 				break;
 			}

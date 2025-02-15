@@ -1,181 +1,207 @@
+#include "main.h"
+
+#include "hypergraph.h"
 #include "table.h"
+#include "mpi.h"
 
-#include <fstream>
-#include <sstream>
-#include <thread>
-#include <boost/algorithm/string.hpp>
+#include <random>
 
-Table::Table() {
-}
+int main(int argc, char *argv[]) {
+	MPI_Init(&argc, &argv);
+	try {
+		std::string action;
+		int randomized_permutations;
+		std::string statistics_directory;
+		po::options_description option_description("Available options");
+		option_description.add_options()
+			("help,h", "show help message")
+			("action,a", po::value<std::string>(&action)->default_value("enumerate"), "generate | enumerate")
+			("input,i", po::value<std::string>()->default_value(fs::current_path().string()), "path to a file or directory")
+			("output,o", po::value<std::string>(), "path to output file/directory")
+			("randomized_permutations,r", po::value<int>(&randomized_permutations)->default_value(0), "number of random permutations to use (uses input permutation by default)")
+			("implementation,I", po::value<std::vector<std::string>>(), "implementation(s) to use, can be used multiple times, available: standard | legacy | brute_force")
+			("statistics_directory,s", po::value<std::string>(&statistics_directory)->default_value(fs::current_path().string()), "path to a directory to write statistics to")
+			("hitting_set_statistics,H", "collect hitting set statistics")
+			("oracle_statistics,O", "collect oracle statistics")
+			("delimiter,d", po::value<char>()->default_value(','), "table delimiter used during graph generation")
+			;
 
-Table::Table(std::string path, char delimiter, int num_records) {
-	if (num_records < 1) return;
-	std::ifstream infile(path);
-	std::string line;
-	getline(infile, line);
-	record r;
-	boost::split(r, line, [delimiter](char c) {return c == delimiter; });
-	m_records.push_back(r);
-	int i_current_line = 2;
-	while (getline(infile, line)) {
-		if (i_current_line > num_records) break;
-		record r;
-		boost::split(r, line, [delimiter](char c) {return c == delimiter; });
-		if (r.size() != m_records[0].size()) {
-			std::cerr << "Record in line " << i_current_line << " appears to be broken, should be " << m_records[0].size() << " but is " << r.size() << "!" << std::endl;
-			return;
+		po::positional_options_description positional_options_description;
+		positional_options_description.add("action", 1).add("input", 1);
+
+		po::variables_map variables_map;
+		po::store(po::command_line_parser(argc, argv).options(option_description).positional(positional_options_description).run(), variables_map);
+		po::notify(variables_map);
+
+		if (variables_map.count("help")) {
+			print_help(option_description);
+			return EXIT_SUCCESS;
 		}
-		m_records.push_back(r);
-		i_current_line++;
-	}
-}
 
-Table::~Table() {
-}
-
-records::size_type Table::num_records() {
-	return m_records.size();
-}
-
-record::size_type Table::num_columns() {
-	if (m_records.empty()) return 0;
-	return m_records[0].size();
-}
-
-void Table::print_table() {
-	if (empty()) return;
-	std::vector<int> max_field_lengths(m_records[0].size(), 0);
-	for (record::size_type i = 0; i < m_records[0].size(); ++i) {
-		for (records::size_type j = 0; j < m_records.size(); ++j) {
-			max_field_lengths[i] = std::max(max_field_lengths[i], (int)m_records[j][i].size());
+		if (randomized_permutations < 0) {
+			std::cerr << "randomized_permutations cannot be smaller than 0" << std::endl;
+			return EXIT_FAILURE;
 		}
-	}
-	for (auto r : m_records) {
-		for (record::size_type i = 0; i < r.size() - 1; ++i) {
-			std::cout << r[i] << std::string(max_field_lengths[i] - r[i].size(), ' ') << " | ";
-		}
-		std::cout << r[r.size() - 1] << std::endl;
-	}
-}
 
-int Table::num_uniques(record::size_type i_column) {
-	if (m_records.empty()) return 0;
-	if (i_column < 0 || i_column >= m_records[0].size()) throw "Requested number of unique values in non-existent column!";
-	std::set<std::string> fields;
-	for (record r : m_records) fields.insert(r[i_column]);
-	return (int)fields.size();
-}
+		fs::path input = fs::system_complete(fs::path(variables_map["input"].as<std::string>()));
 
-void Table::delete_static_columns() {
-	if (m_records.empty()) return;
-	std::vector<record::size_type> remaining_indices;
-	for (record::size_type i_column = 0; i_column < m_records[0].size(); ++i_column) if (num_uniques(i_column) > 1) remaining_indices.push_back(i_column);
-	records new_records;
-	for (record r : m_records) {
-		record new_record;
-		for (auto i_column : remaining_indices) {
-			new_record.push_back(r[i_column]);
-		}
-		new_records.push_back(new_record);
-	}
-	m_records = new_records;
-}
+		if (action == "enumerate") {
 
-bool Table::empty() const {
-	return m_records.empty();
-}
+			std::vector<std::string> implementations;
+			if (variables_map.count("implementation")) implementations = variables_map["implementation"].as<std::vector<std::string>>();
+			else implementations.push_back("standard");
 
-edge_vec Table::edges() const {
-	if (empty()) return edge_vec();
-	std::thread threads[NUM_THREADS];
-	std::vector<edge_set> edge_sets(NUM_THREADS);
-	for (int i = 0; i < NUM_THREADS; ++i) {
-		edge_set edges = edge_sets[i];
-		threads[i] = std::thread(&Table::generate_edges, std::ref(m_records), (records::size_type)i, std::ref(edge_sets[i]));
-	}
-	for (int i = 0; i < NUM_THREADS; ++i) threads[i].join();
-	edge_set edges = edge_sets[0];
-	for (int i = 1; i < NUM_THREADS; ++i) for (edge e : edge_sets[i]) edges.insert(e);
-	return edge_vec(edges.begin(), edges.end());
-}
+			enumerate_configuration configuration;
+			configuration.statistics_directory = fs::system_complete(fs::path(variables_map["statistics_directory"].as<std::string>()));
+			configuration.collect_hitting_set_statistics = (bool)variables_map.count("hitting_set_statistics");
+			configuration.collect_oracle_statistics = (bool)variables_map.count("oracle_statistics");
 
-void Table::generate_edges(const records &m_records, records::size_type i_slice, edge_set &edges) {
-	for (records::size_type i_record = i_slice * m_records.size() / NUM_THREADS; i_record < (i_slice + 1) * m_records.size() / NUM_THREADS; ++i_record) {
-		for (records::size_type record_distance = 1; record_distance < m_records.size() - i_record; ++record_distance) {
-			edge new_edge(m_records[i_record].size());
-			for (edge::size_type i_column = 0; i_column < new_edge.size(); ++i_column) {
-				if (m_records[i_record][i_column] != m_records[i_record + record_distance][i_column]) new_edge[i_column] = 1;
+			if (variables_map.count("output") && randomized_permutations > 0) {
+				std::cerr << "Graphs with randomized permutation cannot be written to output!" << std::endl;
+				exit(EXIT_FAILURE);
 			}
-			bool insert = true;
-			edge_vec to_delete;
-			for (edge e : edges) {
-				if ((e & new_edge) == e) { // subset edge already exists
-					insert = false;
-					break;
+
+			if (configuration.collect_hitting_set_statistics && configuration.collect_oracle_statistics) std::cerr << "WARNING: Collecting hitting set and oracle statistics at the same time. This will lead to imprecise hitting set running time measurements!" << std::endl;
+
+			std::cout << "graph";
+			if (randomized_permutations > 0) std::cout << ",permutation";
+			for (std::string implementation : implementations) std::cout << "," << implementation << "_running_time_ns";
+			std::cout << std::endl;
+
+			for (fs::path graph_path : files_from_path(input, GRAPH_EXTENSION)) {
+				Hypergraph h = Hypergraph(graph_path.string());
+				configuration.name = graph_path.stem().string();
+				if (randomized_permutations == 0) {
+					std::cout << remove_quotations(graph_path.stem().string());
+					for (std::string implementation : implementations) {
+						configuration.implementation = implementation;
+						Hypergraph t;
+						auto start = Clock::now();
+						t = h.enumerate(configuration);
+						auto end = Clock::now();
+						std::cout <<"," << ns_string(start, end);
+						if (variables_map.count("output")) {
+							fs::path output_path = fs::system_complete(fs::path(variables_map["output"].as<std::string>()));
+							if (fs::is_directory(input)) {
+								if (!fs::exists(output_path)) {
+									std::cerr << "Output directory " << output_path << " does not exist!" << std::endl;
+									exit(EXIT_FAILURE);
+								}
+								if (!fs::is_directory(output_path)) {
+									std::cerr << "Directory given as input, but output path " << output_path << " does not describe a directory!" << std::endl;
+									exit(EXIT_FAILURE);
+								}
+								output_path /= fs::path(graph_path.stem().string() + "_transversal");
+								output_path.replace_extension(GRAPH_EXTENSION);
+							}
+							else {
+								if (fs::exists(output_path) && fs::is_directory(output_path)) {
+									output_path /= graph_path.stem();
+									output_path.replace_extension(GRAPH_EXTENSION);
+								}
+							}
+							t.save(output_path.string());
+						}
+					}
+					std::cout << std::endl;
 				}
-				if ((e & new_edge) == new_edge) { // new edge is subset of other one
-					to_delete.push_back(e);
+				else {
+					std::random_device rd;
+					std::mt19937 g(rd());
+					permutation p;
+					for (int i = 0; i < h.m_num_vertices; ++i) p.push_back(i);
+					for (int i = 0; i < randomized_permutations; ++i) {
+						std::shuffle(p.begin(), p.end(), g);
+						h.permute(p);
+						std::cout << remove_quotations(graph_path.stem().string()) << "," << permutation_string(p);
+						for (std::string implementation : implementations) {
+							configuration.implementation = implementation;
+							auto start = Clock::now();
+							h.enumerate(configuration);
+							auto end = Clock::now();
+							std::cout << "," << ns_string(start, end);
+						}
+						std::cout << std::endl;
+					}
 				}
 			}
-			if (insert) {
-				for (auto e : to_delete) edges.erase(e);
-				edges.insert(new_edge);
+		}
+		else if (action == "generate") {
+			for (fs::path table_path : files_from_path(input, TABLE_EXTENSION)) {
+				fs::path output_path = variables_map.count("output") ? fs::system_complete(fs::path(variables_map["output"].as<std::string>())) : fs::current_path();
+				if (fs::is_directory(input)) {
+					if (!fs::exists(output_path)) {
+						std::cerr << "Output directory " << output_path << " does not exist!" << std::endl;
+						exit(EXIT_FAILURE);
+					}						
+					if (!fs::is_directory(output_path)) {
+						std::cerr << "Directory given as input, but output path " << output_path << " does not describe a directory!" << std::endl;
+						exit(EXIT_FAILURE);
+					}
+					output_path /= table_path.stem();
+					output_path.replace_extension(GRAPH_EXTENSION);
+				}
+				else {
+					if (fs::exists(output_path) && fs::is_directory(output_path)) {
+						output_path /= table_path.stem();
+						output_path.replace_extension(GRAPH_EXTENSION);
+					}
+				}
+				std::cerr << "Generating " << table_path.stem() << "..." << std::endl;
+				Table t = Table(table_path.string(), variables_map["delimiter"].as<char>());
+				Hypergraph h = Hypergraph(t);
+				h.save(output_path.string());
 			}
 		}
+		else {
+			std::cerr << "Invalid action: " << action << ". Use --help to show available options." << std::endl;
+		}
+		return 0;
+	}
+	catch (std::exception &e) {
+		std::cout << e.what() << std::endl;
+		return 1;
+	}
+	return 0;
+}
+
+void print_help(const po::options_description &option_description) {
+	std::cout << "Example usages:\n\tenumhyp enumerate path/to/graph.graph\n\tenumhyp enumerate path/to/graph/directory -r 50 -i standard -i legacy -s path/to/statistics/directory -O\n\tenumhyp generate path/to/table.csv\n\tenumhyp generate path/to/table.csv -d ; -o path/to/graph.graph\n\tenumhyp generate path/to/table/directory\n";
+	std::cout << option_description;
+}
+
+void verify_path(const fs::path &path) {
+	if (!fs::exists(path)) {
+		std::cerr << path << " does not exist!" << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	if (fs::is_symlink(path) || fs::is_other(path)) {
+		std::cerr << path << " does not describe a file or directory!" << std::endl;
+		exit(EXIT_FAILURE);
 	}
 }
 
-void Table::sort_columns_descending_uniqueness() {
-	auto mmap = uniques_mmap();
-	records new_records;
-	for (record r : m_records) {
-		record new_record;
-		for (auto i = mmap.rbegin(); i != mmap.rend(); ++i) new_record.push_back(r[i->second]);
-		new_records.push_back(new_record);
+std::vector<fs::path> files_from_path(const fs::path &path, std::string extension) {
+	verify_path(path);
+	std::vector<fs::path> paths;
+	if (fs::is_directory(path)) {
+		std::vector<fs::directory_entry> directory_entries;
+		std::copy(fs::directory_iterator(path), fs::directory_iterator(), back_inserter(directory_entries));
+		std::sort(directory_entries.begin(), directory_entries.end());
+		for (fs::directory_entry& directory_entry : directory_entries) {
+			fs::path file_path = directory_entry.path();
+			if (file_path.extension() == extension) paths.push_back(file_path);
+		}
+		if (paths.empty()) std::cerr << path << " does not contain any files with extension " << extension << "!" << std::endl;
 	}
-	m_records = new_records;
-}
-
-void Table::sort_columns_ascending_uniqueness() {
-	auto mmap = uniques_mmap();
-	records new_records;
-	for (record r : m_records) {
-		record new_record;
-		for (auto i = mmap.begin(); i != mmap.end(); ++i) new_record.push_back(r[i->second]);
-		new_records.push_back(new_record);
+	else {
+		paths.push_back(path);
 	}
-	m_records = new_records;
+	return paths;
 }
 
-void Table::sort_records() {
-	std::sort(m_records.begin(), m_records.end());
-}
-
-std::multimap<int, record::size_type> Table::uniques_mmap() {
-	std::multimap<int, record::size_type> mmap;
-	if (empty()) return mmap;
-	for (record::size_type i = 0; i < m_records[0].size(); ++i) mmap.insert(std::pair<int, record::size_type>(num_uniques(i), i));
-	return mmap;
-}
-
-void Table::save(std::string path, std::vector<std::string> header) {
-	std::ofstream outfile;
-	outfile.open(path);
-	if (!header.empty()) {
-		for (std::vector<std::string>::size_type i = 0; i < header.size() - 1; ++i) outfile << header[i] << ",";
-		outfile << header[header.size() - 1] << std::endl;
-	}
-	for (record r : m_records) {
-		for (record::size_type i = 0; i < r.size() - 1; ++i) outfile << r[i] << ",";
-		outfile << r[r.size() - 1] << std::endl;
-	}
-	outfile.close();
-}
-
-void Table::add_record(record r) {
-	m_records.push_back(r);
-}
-
-void Table::clear() {
-	m_records.clear();
+fs::path directory_from_path(fs::path path) {
+	verify_path(path);
+	if (fs::is_directory(path)) return path;
+	return path.parent_path();
 }
